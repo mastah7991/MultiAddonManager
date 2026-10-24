@@ -38,6 +38,7 @@ CConVar<bool> mm_cache_clients_with_addons("mm_cache_clients_with_addons", FCVAR
 CConVar<float> mm_cache_clients_duration("mm_cache_clients_duration", FCVAR_NONE, "How long to cache clients' downloaded addons list in seconds, pass 0 for forever.", 0.0f);
 CConVar<float> mm_addon_connection_timeout("mm_addon_connection_timeout", FCVAR_NONE, "How long until clients are timed out while downloading the first required addon (usually the current map), 0 disables", 30.f);
 CConVar<float> mm_extra_addons_timeout("mm_extra_addons_timeout", FCVAR_NONE, "How long until clients are timed out in between connects for extra addons in seconds, requires mm_extra_addons to be used", 10.f);
+CConVar<bool> mm_changelevel_keep_connection("mm_changelevel_keep_connection", FCVAR_NONE, "Whether clients that already have every addon of the next map change level without reconnecting (a reconnect kills server voice until the game restarts)", true);
 
 CConVar<bool> mm_addon_debug("mm_addon_debug", FCVAR_NONE, "Whether to print some extra debug information", false);
 
@@ -175,6 +176,9 @@ struct ClientAddonInfo_t
 	double lastActiveTime {};
 	std::vector<AddonId> addonsToLoad;
 	std::vector<AddonId> downloadedAddons;
+	// Addons the client had mounted when it last went active. Unlike downloadedAddons this survives
+	// ClientActive without mm_cache_clients_with_addons, it decides whether a changelevel may skip the reconnect.
+	std::vector<AddonId> haveAddons;
 	AddonId currentPendingAddon;
 	ClientConnectedState_t connectedState = CLIENTCONN_NONE;
 	double connectionStartTime {};
@@ -984,6 +988,46 @@ KHook::Return<bool> MultiAddonManager::Hook_SendNetMessage(CServerSideClientBase
 
 	if (pMsg->signon_state() == SIGNONSTATE_CHANGELEVEL)
 	{
+		// A changelevel whose addon list starts with a workshop ID makes the client download it and open a new
+		// connection, which starts with no addons mounted. Going from some addons to none unloads every sound
+		// resource, including the procedural server voice sound, which never comes back: voice stays dead until
+		// the game restarts. Any other list keeps the connection and mounts the whole list directly, so when the
+		// client already has the extra addons, send the full list behind a ',' (the client's split drops empty entries).
+		// The new map is not checked: like a plain changelevel, it has to be on the client's disk already.
+		if (mm_changelevel_keep_connection.Get() && !addons.empty())
+		{
+			bool bHasAll = true;
+			for (const auto &addon : addons)
+			{
+				if (addon == GetCurrentWorkshopMap())
+					continue;
+				if (!Contains(clientInfo.haveAddons, addon) && !Contains(clientInfo.downloadedAddons, addon))
+				{
+					bHasAll = false;
+					break;
+				}
+			}
+
+			if (bHasAll)
+			{
+				pMsg->set_addons(("," + VectorToString(addons)).c_str());
+				clientInfo.currentPendingAddon.clear();
+
+				// The whole list is mounted on this connection, so the signon messages of the next map must not
+				// prompt for any of it. A new connection still starts from downloadedAddons and gets each one again.
+				for (const auto &addon : addons)
+				{
+					if (!Contains(clientInfo.downloadedAddons, addon))
+						clientInfo.downloadedAddons.push_back(addon);
+				}
+
+				if (mm_addon_debug.Get())
+					Message("%s: Client %lli keeps its connection through the changelevel with addons %s\n", __func__, steamID64, pMsg->addons().c_str());
+
+				return {KHook::Action::Ignore};
+			}
+		}
+
 		// When switching to another map, the signon message might contain more than 1 addon.
 		// This puts the client in limbo because client doesn't know how to handle multiple addons at the same time.
 		std::vector<AddonId> addonsList;
@@ -1136,6 +1180,15 @@ KHook::Return<void> MultiAddonManager::Hook_ClientDisconnect_Post(IServerGameCli
 
 KHook::Return<void> MultiAddonManager::Hook_ClientActive_Post(IServerGameClients *pThis, CPlayerSlot slot, bool bLoadGame, const char * pszName, uint64 steamID64)
 {
+	// When the client reaches this stage, it has every addon of its list mounted.
+	std::vector<AddonId> addons;
+	GetClientAddons(addons, steamID64);
+	for (const auto &addon : addons)
+	{
+		if (!Contains(g_ClientAddons[steamID64].haveAddons, addon))
+			g_ClientAddons[steamID64].haveAddons.push_back(addon);
+	}
+
 	// When the client reaches this stage, they should already have all the necessary addons downloaded, so we can safely remove the downloaded addons list here.
 	if (!mm_cache_clients_with_addons.Get())
 		g_ClientAddons[steamID64].downloadedAddons.clear();
